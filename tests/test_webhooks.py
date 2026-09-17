@@ -6,6 +6,7 @@ import hmac
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -20,12 +21,13 @@ def _sign(body: bytes) -> str:
 
 
 def _post_event(base_url: str, target_path: str, key: str | None = None,
-                payload=None, extra_query: str = "") -> httpx.Response:
+                payload=None, extra_query: str = "",
+                extra_fields: bytes = b"") -> httpx.Response:
     key = key or uuid.uuid4().hex
     body = (
         b'{"idempotency_key":"' + key.encode()
         + b'","target":"' + f"{base_url}{target_path}{extra_query}".encode()
-        + b'","payload":' + (payload or b'{"v":1}') + b"}"
+        + b'","payload":' + (payload or b'{"v":1}') + extra_fields + b"}"
     )
     return httpx.post(
         f"{base_url}/events",
@@ -34,12 +36,22 @@ def _post_event(base_url: str, target_path: str, key: str | None = None,
     )
 
 
+def _window_fields(deliver_after: str | None = None,
+                   expires_at: str | None = None) -> bytes:
+    """Extra JSON object fields carrying a delivery window."""
+    extra = b""
+    if deliver_after is not None:
+        extra += b',"deliver_after":"' + deliver_after.encode() + b'"'
+    if expires_at is not None:
+        extra += b',"expires_at":"' + expires_at.encode() + b'"'
+    return extra
+
+
 def _get_event(base_url: str, event_id: str) -> dict:
     return httpx.get(f"{base_url}/events/{event_id}").json()
 
 
-def _parse_iso(value: str):
-    from datetime import datetime
+def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
@@ -406,3 +418,208 @@ def test_concurrent_replays_apply_exactly_once(server):
     # No duplicate delivery resulted from the replay race.
     mine = [r for r in receipts if r["event_id"] == event_id]
     assert len(mine) == 5
+
+
+# ------------------------------------------------------- delivery windows
+
+def test_default_window_fields_on_plain_event(server):
+    resp = _post_event(
+        server.base_url, "/t/record", extra_query=f"?lane={uuid.uuid4().hex}"
+    )
+    assert resp.status_code == 201
+    event = resp.json()
+    assert event["expires_at"] is None
+    # deliver_after defaults to the creation moment.
+    delta = abs(
+        (_parse_iso(event["deliver_after"]) - _parse_iso(event["created_at"]))
+        .total_seconds()
+    )
+    assert delta < 1
+    # A default window does not delay anything.
+    wait_for(lambda: (lambda e: e if e["status"] == "delivered" else None)(
+        _get_event(server.base_url, event["id"])
+    ))
+
+
+def test_invalid_delivery_window_returns_422(server):
+    now = datetime.now(timezone.utc)
+    past = (now - timedelta(seconds=30)).isoformat()
+    soon = (now + timedelta(seconds=30)).isoformat()
+    later = (now + timedelta(seconds=60)).isoformat()
+
+    # expires_at must be strictly later than deliver_after.
+    r = _post_event(server.base_url, "/t/record",
+                    extra_fields=_window_fields(deliver_after=later, expires_at=soon))
+    assert r.status_code == 422
+    r = _post_event(server.base_url, "/t/record",
+                    extra_fields=_window_fields(deliver_after=soon, expires_at=soon))
+    assert r.status_code == 422
+    # expires_at alone must still be later than the default deliver_after (now).
+    r = _post_event(server.base_url, "/t/record",
+                    extra_fields=_window_fields(expires_at=past))
+    assert r.status_code == 422
+    # Malformed and timezone-naive timestamps are not valid RFC 3339.
+    r = _post_event(server.base_url, "/t/record",
+                    extra_fields=_window_fields(deliver_after="not-a-timestamp"))
+    assert r.status_code == 422
+    r = _post_event(server.base_url, "/t/record",
+                    extra_fields=_window_fields(deliver_after="2030-01-01T00:00:00"))
+    assert r.status_code == 422
+
+    # A rejected request stores nothing: the same key can be used again.
+    key = f"bad-window-{uuid.uuid4().hex}"
+    r = _post_event(server.base_url, "/t/record", key=key,
+                    extra_fields=_window_fields(expires_at=past))
+    assert r.status_code == 422
+    r = _post_event(server.base_url, "/t/record", key=key,
+                    extra_query=f"?lane={uuid.uuid4().hex}")
+    assert r.status_code == 201
+
+
+def test_deliver_after_postpones_delivery(server):
+    lane = f"?lane={uuid.uuid4().hex}"
+    deliver_after = (datetime.now(timezone.utc) + timedelta(seconds=1.5)).isoformat()
+    resp = _post_event(server.base_url, "/t/record", extra_query=lane,
+                       extra_fields=_window_fields(deliver_after=deliver_after))
+    assert resp.status_code == 201
+    event = resp.json()
+    assert _parse_iso(event["deliver_after"]) == _parse_iso(deliver_after)
+    assert event["expires_at"] is None
+
+    # Before deliver_after the scheduler must not touch the event.
+    time.sleep(0.8)
+    pending = _get_event(server.base_url, event["id"])
+    assert pending["status"] == "queued"
+    assert pending["attempts_count"] == 0
+
+    # Once the moment arrives it is delivered, not before.
+    final = wait_for(lambda: (lambda e: e if e["status"] == "delivered" else None)(
+        _get_event(server.base_url, event["id"])
+    ), timeout=10)
+    attempted = _parse_iso(final["attempts"][0]["attempted_at"])
+    assert attempted >= _parse_iso(deliver_after) - timedelta(milliseconds=100)
+
+
+def test_not_yet_due_event_still_blocks_later_events_for_same_target(server):
+    lane = f"?lane={uuid.uuid4().hex}"
+    deliver_after = (datetime.now(timezone.utc) + timedelta(seconds=1.5)).isoformat()
+    first = _post_event(server.base_url, "/t/record", extra_query=lane,
+                        extra_fields=_window_fields(deliver_after=deliver_after))
+    first_id = first.json()["id"]
+    second = _post_event(server.base_url, "/t/record", extra_query=lane)
+    second_id = second.json()["id"]
+
+    # The second event is due immediately, but the earlier one is not yet —
+    # creation order still wins, so nothing may be delivered.
+    time.sleep(0.8)
+    assert _get_event(server.base_url, first_id)["attempts_count"] == 0
+    blocked = _get_event(server.base_url, second_id)
+    assert blocked["status"] == "queued"
+    assert blocked["attempts_count"] == 0
+
+    wait_for(lambda: (lambda e: e if e["status"] == "delivered" else None)(
+        _get_event(server.base_url, first_id)
+    ), timeout=10)
+    wait_for(lambda: (lambda e: e if e["status"] == "delivered" else None)(
+        _get_event(server.base_url, second_id)
+    ), timeout=10)
+    t1 = _parse_iso(_get_event(server.base_url, first_id)["attempts"][0]["attempted_at"])
+    t2 = _parse_iso(_get_event(server.base_url, second_id)["attempts"][0]["attempted_at"])
+    assert t1 <= t2
+
+
+def test_queued_event_expires_without_attempts_and_unblocks_followers(server):
+    from .conftest import _gates
+    token = f"expire-{uuid.uuid4().hex}"
+    _gates[token] = threading.Event()
+    lane = f"?token={token}"
+
+    blocker = _post_event(server.base_url, "/t/block", extra_query=lane)
+    blocker_id = blocker.json()["id"]
+    wait_for(
+        lambda: _get_event(server.base_url, blocker_id)["status"] == "processing",
+        timeout=10,
+    )
+
+    # Queued behind the in-flight blocker; its window closes while waiting.
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=1.0)).isoformat()
+    expiring = _post_event(server.base_url, "/t/block", extra_query=lane,
+                           extra_fields=_window_fields(expires_at=expires_at))
+    expiring_id = expiring.json()["id"]
+    assert expiring.json()["expires_at"] is not None
+    follower = _post_event(server.base_url, "/t/block", extra_query=lane)
+    follower_id = follower.json()["id"]
+
+    # The event expires in place: no attempt is ever recorded for it.
+    expired = wait_for(lambda: (lambda e: e if e["status"] == "expired" else None)(
+        _get_event(server.base_url, expiring_id)
+    ), timeout=10)
+    assert expired["attempts_count"] == 0
+    assert expired["attempts"] == []
+    assert _parse_iso(expired["expires_at"]) == _parse_iso(expires_at)
+
+    # The new status is exposed through the list filter, with window fields.
+    listed = httpx.get(f"{server.base_url}/events", params={"status": "expired"}).json()
+    entry = [e for e in listed["events"] if e["id"] == expiring_id]
+    assert entry and entry[0]["deliver_after"] and entry[0]["expires_at"]
+
+    # Releasing the blocker lets the follower through; the expired event is
+    # skipped and stays expired.
+    httpx.post(f"{server.base_url}/t/release", params={"token": token})
+    wait_for(lambda: (lambda e: e if e["status"] == "delivered" else None)(
+        _get_event(server.base_url, blocker_id)
+    ), timeout=10)
+    wait_for(lambda: (lambda e: e if e["status"] == "delivered" else None)(
+        _get_event(server.base_url, follower_id)
+    ), timeout=10)
+    still = _get_event(server.base_url, expiring_id)
+    assert still["status"] == "expired"
+    assert still["attempts_count"] == 0
+
+
+def test_processing_event_is_not_interrupted_by_expiry(server):
+    from .conftest import _gates
+    token = f"expire-inflight-{uuid.uuid4().hex}"
+    _gates[token] = threading.Event()
+
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=1.0)).isoformat()
+    resp = _post_event(server.base_url, "/t/block", extra_query=f"?token={token}",
+                       extra_fields=_window_fields(expires_at=expires_at))
+    event_id = resp.json()["id"]
+    wait_for(
+        lambda: _get_event(server.base_url, event_id)["status"] == "processing",
+        timeout=10,
+    )
+
+    # expires_at passes mid-flight: an in-flight delivery is never
+    # interrupted by its window closing.
+    time.sleep(1.5)
+    assert _get_event(server.base_url, event_id)["status"] == "processing"
+
+    httpx.post(f"{server.base_url}/t/release", params={"token": token})
+    final = wait_for(lambda: (lambda e: e if e["status"] == "delivered" else None)(
+        _get_event(server.base_url, event_id)
+    ), timeout=10)
+    assert final["attempts_count"] == 1
+    assert final["delivered_at"]
+
+
+def test_duplicate_key_returns_original_event_with_its_window(server):
+    key = f"dup-window-{uuid.uuid4().hex}"
+    lane = f"?lane={uuid.uuid4().hex}"
+    deliver_after = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+    r1 = _post_event(server.base_url, "/t/record", key=key, extra_query=lane,
+                     extra_fields=_window_fields(deliver_after, expires_at))
+    assert r1.status_code == 201
+
+    # Replaying the key — even with a different window — returns the stored
+    # event unchanged and enqueues nothing new.
+    other = (datetime.now(timezone.utc) + timedelta(seconds=90)).isoformat()
+    r2 = _post_event(server.base_url, "/t/record", key=key, extra_query=lane,
+                     extra_fields=_window_fields(expires_at=other))
+    assert r2.status_code == 200
+    assert r2.headers.get("idempotent-replay") == "true"
+    assert r2.json()["id"] == r1.json()["id"]
+    assert _parse_iso(r2.json()["deliver_after"]) == _parse_iso(deliver_after)
+    assert _parse_iso(r2.json()["expires_at"]) == _parse_iso(expires_at)

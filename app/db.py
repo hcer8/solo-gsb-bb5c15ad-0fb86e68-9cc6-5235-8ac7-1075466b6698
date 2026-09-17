@@ -23,7 +23,9 @@ from . import config
 #   delivered  - got a 2xx response (terminal)
 #   dead       - all attempts of the current round exhausted (dead-letter);
 #                terminal unless replayed, which starts a fresh backoff round
-TERMINAL_STATUSES = ("delivered", "dead")
+#   expired    - still queued when its expires_at was reached (terminal);
+#                never produces an attempt and stops blocking its endpoint
+TERMINAL_STATUSES = ("delivered", "dead", "expired")
 
 
 class ReplayNotAllowedError(Exception):
@@ -41,7 +43,12 @@ _conn: sqlite3.Connection | None = None
 
 
 def _iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    return _iso_utc(datetime.now(timezone.utc))
+
+
+def _iso_utc(dt: datetime) -> str:
+    """Canonical UTC ISO-8601 text form used for every stored timestamp."""
+    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def get_conn() -> sqlite3.Connection:
@@ -70,6 +77,9 @@ def init_db() -> None:
                 attempts_count  INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL,
                 next_attempt_at REAL,
+                deliver_after   TEXT,
+                expires_at      TEXT,
+                expires_at_epoch REAL,
                 delivered_at    TEXT,
                 replay_count    INTEGER NOT NULL DEFAULT 0,
                 last_replayed_at TEXT,
@@ -96,21 +106,30 @@ def init_db() -> None:
 
 
 def _migrate_events(conn: sqlite3.Connection) -> None:
-    """Add replay columns to databases created before replay existed.
+    """Add newer columns to databases created before they existed.
 
     ``CREATE TABLE IF NOT EXISTS`` leaves pre-existing files untouched, so
-    the new columns are added idempotently here. Existing rows receive the
-    defaults (``replay_count=0``, ``round_base_attempts=0``), which keeps
-    their behaviour identical to the pre-replay state machine.
+    the new columns are added idempotently here. Existing rows receive
+    defaults that keep their behaviour identical to before: replay counters
+    start at zero, and ``deliver_after`` is backfilled with ``created_at``
+    (those events were deliverable immediately) with no expiry.
     """
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
     for column, ddl in (
         ("replay_count", "replay_count INTEGER NOT NULL DEFAULT 0"),
         ("last_replayed_at", "last_replayed_at TEXT"),
         ("round_base_attempts", "round_base_attempts INTEGER NOT NULL DEFAULT 0"),
+        ("deliver_after", "deliver_after TEXT"),
+        ("expires_at", "expires_at TEXT"),
+        ("expires_at_epoch", "expires_at_epoch REAL"),
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE events ADD COLUMN {ddl}")
+    # Events stored before delivery windows existed were deliverable from
+    # the moment they were created, so created_at is the honest value.
+    conn.execute(
+        "UPDATE events SET deliver_after = created_at WHERE deliver_after IS NULL"
+    )
 
 
 def reset_stuck_events() -> None:
@@ -131,12 +150,22 @@ def reset_stuck_events() -> None:
 
 
 def create_event(
-    idempotency_key: str, target: str, payload: dict | list
+    idempotency_key: str,
+    target: str,
+    payload: dict | list,
+    deliver_after: datetime | None = None,
+    expires_at: datetime | None = None,
 ) -> tuple[dict, bool]:
     """Insert an event. Returns ``(event, created)``.
 
     If the idempotency key already exists the stored event is returned with
     ``created=False``; nothing is inserted and nothing is enqueued again.
+
+    ``deliver_after`` defaults to the creation moment and seeds
+    ``next_attempt_at``, so the scheduler can never claim the event before
+    then. ``expires_at`` is optional; once it passes while the event is
+    still queued, the claim sweep marks the event ``expired`` instead of
+    delivering it. Both are stored normalized to UTC.
     """
     event_id = uuid.uuid4().hex
     payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -148,12 +177,24 @@ def create_event(
         if existing is not None:
             return dict(existing), False
 
-        now = time.time()
+        deliver_after = deliver_after or datetime.now(timezone.utc)
+        deliver_after_epoch = deliver_after.timestamp()
         conn.execute(
             "INSERT INTO events "
             "(id, idempotency_key, target, payload, status, attempts_count, "
-            " created_at, next_attempt_at) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)",
-            (event_id, idempotency_key, target, payload_json, _iso(), now),
+            " created_at, next_attempt_at, deliver_after, expires_at, "
+            " expires_at_epoch) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                idempotency_key,
+                target,
+                payload_json,
+                _iso(),
+                deliver_after_epoch,
+                _iso_utc(deliver_after),
+                _iso_utc(expires_at) if expires_at is not None else None,
+                expires_at.timestamp() if expires_at is not None else None,
+            ),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
@@ -170,18 +211,34 @@ def _hydrate(row: sqlite3.Row) -> dict:
 
 
 def claim_due_events() -> list[dict]:
-    """Atomically claim the head event of every endpoint that is due.
+    """Expire stale queued events, then claim due head events — atomically.
 
-    An event is claimable only when it is ``queued``, its backoff has
-    elapsed, and no earlier (lower rowid = earlier creation) event for the
-    same target is still ``queued``/``processing``. Claimed events flip to
-    ``processing`` so another tick can never double-claim them. This is the
-    ordering guarantee: a later event cannot be picked while an earlier one
-    is pending, in flight, or waiting for its retry backoff.
+    One transaction does two things:
+
+    1. Expiry sweep: every ``queued`` event whose ``expires_at`` has been
+       reached flips to ``expired``. It never produces an attempt and,
+       being terminal, stops blocking later events for the same target.
+       Events already ``processing`` are never touched — an in-flight
+       delivery is allowed to finish even if its window closes mid-flight.
+    2. Claim: an event is claimable only when it is ``queued``, its
+       backoff has elapsed and its ``deliver_after`` has arrived (both are
+       encoded in ``next_attempt_at``), and no earlier (lower rowid =
+       earlier creation) event for the same target is still
+       ``queued``/``processing``. Claimed events flip to ``processing`` so
+       another tick can never double-claim them. This is the ordering
+       guarantee: a later event cannot be picked while an earlier one is
+       pending — even if the earlier one is not yet due — in flight, or
+       waiting for its retry backoff.
     """
     now = time.time()
     with db_lock:
         conn = get_conn()
+        conn.execute(
+            "UPDATE events SET status = 'expired', next_attempt_at = NULL "
+            "WHERE status = 'queued' AND expires_at_epoch IS NOT NULL "
+            "AND expires_at_epoch <= ?",
+            (now,),
+        )
         rows = conn.execute(
             """
             SELECT e.* FROM events e
@@ -202,7 +259,7 @@ def claim_due_events() -> list[dict]:
                 "UPDATE events SET status = 'processing' WHERE id = ?",
                 [(r["id"],) for r in rows],
             )
-            conn.commit()
+        conn.commit()
         return [_hydrate(r) for r in rows]
 
 

@@ -7,11 +7,19 @@ import json
 import logging
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from pydantic import (
+    BaseModel,
+    Field,
+    HttpUrl,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from . import config, db
 from .worker import Worker
@@ -24,6 +32,31 @@ class EventIn(BaseModel):
     idempotency_key: str = Field(min_length=1)
     target: HttpUrl
     payload: Any = Field(default_factory=dict)
+    deliver_after: datetime | None = None
+    expires_at: datetime | None = None
+
+    @field_validator("deliver_after", "expires_at")
+    @classmethod
+    def _rfc3339_timestamp(cls, value: datetime | None) -> datetime | None:
+        # RFC 3339 timestamps always carry a numeric offset (or "Z"); a
+        # naive datetime would be ambiguous, so reject it outright.
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError(
+                "timestamp must be RFC 3339 with a timezone offset"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _window_is_ordered(self) -> "EventIn":
+        # deliver_after defaults to the creation moment, so an expires_at
+        # given alone must still lie in the future.
+        if self.expires_at is not None:
+            deliver_after = self.deliver_after or datetime.now(timezone.utc)
+            if self.expires_at <= deliver_after:
+                raise ValueError("expires_at must be later than deliver_after")
+        return self
 
 
 # In-memory counters for the built-in demo sink (not part of the core API).
@@ -41,6 +74,8 @@ def _public_event(event: dict) -> dict:
         "status": event["status"],
         "attempts_count": event["attempts_count"],
         "created_at": event["created_at"],
+        "deliver_after": event.get("deliver_after"),
+        "expires_at": event.get("expires_at"),
         "delivered_at": event.get("delivered_at"),
         "replay_count": event.get("replay_count", 0),
         "last_replayed_at": event.get("last_replayed_at"),
@@ -75,7 +110,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.1.0",
+    version="1.2.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events.",
     lifespan=lifespan,
 )
@@ -89,6 +124,10 @@ async def create_event(request: Request) -> JSONResponse:
     header computed with the shared secret from ``WEBHOOK_SECRET``.
     Replaying an existing idempotency key returns the stored event (200)
     and never enqueues a second delivery.
+
+    The optional delivery window (``deliver_after`` / ``expires_at``, both
+    RFC 3339) postpones delivery and/or bounds how long the event may wait
+    in the queue; invalid combinations are rejected with 422.
     """
     raw_body = await request.body()
     signature = request.headers.get(config.SIGNATURE_HEADER)
@@ -107,12 +146,16 @@ async def create_event(request: Request) -> JSONResponse:
     try:
         event_in = EventIn(**data)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        # exc.errors() can embed non-JSON values (the original exception in
+        # "ctx", datetimes in "input"); exc.json() is always serializable.
+        raise HTTPException(status_code=422, detail=json.loads(exc.json()))
 
     event, created = db.create_event(
         idempotency_key=event_in.idempotency_key,
         target=str(event_in.target),
         payload=event_in.payload,
+        deliver_after=event_in.deliver_after,
+        expires_at=event_in.expires_at,
     )
     full = db.get_event(event["id"])
     response = JSONResponse(
@@ -125,7 +168,9 @@ async def create_event(request: Request) -> JSONResponse:
 
 @app.get("/events")
 async def list_events(
-    status: str | None = Query(None, pattern="^(queued|processing|delivered|dead)$"),
+    status: str | None = Query(
+        None, pattern="^(queued|processing|delivered|dead|expired)$"
+    ),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):

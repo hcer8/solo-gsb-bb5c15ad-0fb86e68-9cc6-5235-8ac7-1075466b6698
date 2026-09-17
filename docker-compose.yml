@@ -13,8 +13,9 @@ services:
       DELIVERY_TIMEOUT: "10"
     volumes:
       # Persists events, delivery attempts and dead-letter/replay state
-      # (replay_count, last_replayed_at). Older databases are migrated in
-      # place on startup — the replay columns are added automatically.
+      # (replay_count, last_replayed_at) plus the delivery window
+      # (deliver_after, expires_at). Older databases are migrated in
+      # place on startup — the new columns are added automatically.
       - webhook-data:/data
     restart: unless-stopped
 

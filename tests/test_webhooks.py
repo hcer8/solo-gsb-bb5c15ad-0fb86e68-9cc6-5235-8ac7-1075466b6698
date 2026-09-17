@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -36,6 +38,16 @@ def _post_event(base_url: str, target_path: str, key: str | None = None,
 
 def _get_event(base_url: str, event_id: str) -> dict:
     return httpx.get(f"{base_url}/events/{event_id}").json()
+
+
+def _post_event_obj(base_url: str, obj: dict) -> httpx.Response:
+    """POST /events with an arbitrary JSON body (for delivery-window fields)."""
+    body = json.dumps(obj).encode()
+    return httpx.post(
+        f"{base_url}/events",
+        content=body,
+        headers={"X-Webhook-Signature": _sign(body), "Content-Type": "application/json"},
+    )
 
 
 def _parse_iso(value: str):
@@ -406,3 +418,261 @@ def test_concurrent_replays_apply_exactly_once(server):
     # No duplicate delivery resulted from the replay race.
     mine = [r for r in receipts if r["event_id"] == event_id]
     assert len(mine) == 5
+
+
+# --------------------------------------------------------- delivery windows
+
+def test_window_fields_default_and_roundtrip(server):
+    resp = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": f"{server.base_url}/t/record",
+        "payload": {},
+    })
+    assert resp.status_code == 201
+    event = resp.json()
+    # deliver_after defaults to the creation moment; expires_at is unset.
+    assert _parse_iso(event["deliver_after"]) == _parse_iso(event["created_at"])
+    assert event["expires_at"] is None
+
+    # Every query endpoint exposes the window fields.
+    by_id = _get_event(server.base_url, event["id"])
+    assert by_id["deliver_after"] == event["deliver_after"]
+    assert by_id["expires_at"] is None
+    by_key = httpx.get(
+        f"{server.base_url}/events/key/{event['idempotency_key']}"
+    ).json()
+    assert by_key["deliver_after"] == event["deliver_after"]
+    listed = httpx.get(f"{server.base_url}/events").json()
+    entry = [e for e in listed["events"] if e["id"] == event["id"]]
+    assert entry and entry[0]["deliver_after"] == event["deliver_after"]
+
+
+def test_deliver_after_postpones_delivery(server):
+    deliver_after = datetime.now(timezone.utc) + timedelta(seconds=1.5)
+    resp = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": f"{server.base_url}/t/record",
+        "payload": {},
+        "deliver_after": deliver_after.isoformat(),
+    })
+    assert resp.status_code == 201
+    event = resp.json()
+    assert _parse_iso(event["deliver_after"]) == deliver_after
+    assert event["expires_at"] is None
+
+    # Before the window opens: still queued, zero attempts.
+    time.sleep(1.0)
+    pending = _get_event(server.base_url, event["id"])
+    assert pending["status"] == "queued"
+    assert pending["attempts_count"] == 0
+
+    # Afterwards it is delivered, never earlier than deliver_after.
+    final = wait_for(
+        lambda: (lambda e: e if e["status"] == "delivered" else None)(
+            _get_event(server.base_url, event["id"])
+        ),
+        timeout=10,
+    )
+    assert _parse_iso(final["delivered_at"]) >= deliver_after
+    assert final["attempts_count"] == 1
+
+
+def test_delayed_head_event_still_blocks_later_events(server):
+    """An earlier event waiting for deliver_after keeps blocking its target."""
+    target = f"{server.base_url}/t/record"
+    deliver_after = datetime.now(timezone.utc) + timedelta(seconds=1.5)
+    first = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": target,
+        "payload": {},
+        "deliver_after": deliver_after.isoformat(),
+    })
+    first_id = first.json()["id"]
+    second = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": target,
+        "payload": {},
+    })
+    second_id = second.json()["id"]
+
+    # The second event has no delay of its own but must not overtake the
+    # not-yet-due head event.
+    time.sleep(1.0)
+    assert _get_event(server.base_url, first_id)["status"] == "queued"
+    second_e = _get_event(server.base_url, second_id)
+    assert second_e["status"] == "queued"
+    assert second_e["attempts_count"] == 0
+
+    wait_for(lambda: _get_event(server.base_url, first_id)["status"] == "delivered")
+    wait_for(lambda: _get_event(server.base_url, second_id)["status"] == "delivered")
+    t1 = _parse_iso(_get_event(server.base_url, first_id)["delivered_at"])
+    t2 = _parse_iso(_get_event(server.base_url, second_id)["delivered_at"])
+    assert deliver_after <= t1 <= t2
+
+
+def test_invalid_delivery_window_returns_422(server):
+    now = datetime.now(timezone.utc)
+    base = {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": f"{server.base_url}/t/record",
+        "payload": {},
+    }
+    # expires_at before deliver_after.
+    resp = _post_event_obj(server.base_url, base | {
+        "deliver_after": (now + timedelta(seconds=10)).isoformat(),
+        "expires_at": (now + timedelta(seconds=5)).isoformat(),
+    })
+    assert resp.status_code == 422
+    # Equal is not "later".
+    same = (now + timedelta(seconds=10)).isoformat()
+    resp = _post_event_obj(
+        server.base_url, base | {"deliver_after": same, "expires_at": same}
+    )
+    assert resp.status_code == 422
+    # Not RFC 3339 at all / missing timezone offset.
+    resp = _post_event_obj(server.base_url, base | {"deliver_after": "not-a-date"})
+    assert resp.status_code == 422
+    resp = _post_event_obj(
+        server.base_url, base | {"expires_at": "2030-01-01 00:00:00"}
+    )
+    assert resp.status_code == 422
+    # Nothing was stored for any of those attempts.
+    assert (
+        httpx.get(f"{server.base_url}/events/key/{base['idempotency_key']}").status_code
+        == 404
+    )
+
+
+def test_duplicate_key_returns_original_despite_window_fields(server):
+    key = uuid.uuid4().hex
+    r1 = _post_event_obj(server.base_url, {
+        "idempotency_key": key,
+        "target": f"{server.base_url}/t/record",
+        "payload": {},
+        "deliver_after": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
+    })
+    assert r1.status_code == 201
+
+    # Same key with a different (valid) window: the stored event wins.
+    r2 = _post_event_obj(server.base_url, {
+        "idempotency_key": key,
+        "target": f"{server.base_url}/t/record",
+        "payload": {},
+        "deliver_after": (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=50)).isoformat(),
+    })
+    assert r2.status_code == 200
+    assert r2.headers.get("idempotent-replay") == "true"
+    assert r2.json()["id"] == r1.json()["id"]
+    assert r2.json()["deliver_after"] == r1.json()["deliver_after"]
+    assert r2.json()["expires_at"] is None
+
+    # Even an invalid window on a duplicate key yields the original event.
+    now = datetime.now(timezone.utc)
+    r3 = _post_event_obj(server.base_url, {
+        "idempotency_key": key,
+        "target": f"{server.base_url}/t/record",
+        "payload": {},
+        "deliver_after": (now + timedelta(seconds=10)).isoformat(),
+        "expires_at": (now + timedelta(seconds=5)).isoformat(),
+    })
+    assert r3.status_code == 200
+    assert r3.json()["id"] == r1.json()["id"]
+
+    wait_for(
+        lambda: _get_event(server.base_url, r1.json()["id"])["status"] == "delivered"
+    )
+    mine = [r for r in receipts if r["idempotency_key"] == key]
+    assert len(mine) == 1  # exactly one delivery ever
+
+
+def test_queued_event_expires_without_attempt_and_unblocks_next(server):
+    from .conftest import _gates
+    token = f"expire-{uuid.uuid4().hex}"
+    _gates[token] = threading.Event()
+
+    first = _post_event(server.base_url, "/t/block", extra_query=f"?token={token}")
+    first_id = first.json()["id"]
+    wait_for(
+        lambda: _get_event(server.base_url, first_id)["status"] == "processing",
+        timeout=10,
+    )
+
+    # The middle event is queued behind the blocked head and its window
+    # closes while it waits.
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=1.0)
+    second = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": f"{server.base_url}/t/block?token={token}",
+        "payload": {},
+        "expires_at": expires_at.isoformat(),
+    })
+    assert second.status_code == 201
+    second_id = second.json()["id"]
+    assert second.json()["expires_at"] is not None
+
+    third = _post_event(server.base_url, "/t/block", extra_query=f"?token={token}")
+    third_id = third.json()["id"]
+
+    try:
+        expired = wait_for(
+            lambda: (lambda e: e if e["status"] == "expired" else None)(
+                _get_event(server.base_url, second_id)
+            ),
+            timeout=10,
+        )
+        # Expired while queued: no attempt was ever made.
+        assert expired["attempts_count"] == 0
+        assert expired["attempts"] == []
+        # The head is still in flight, so the third event stays queued.
+        assert _get_event(server.base_url, third_id)["status"] == "queued"
+    finally:
+        httpx.post(f"{server.base_url}/t/release", params={"token": token})
+
+    # The expired event is skipped; the queue continues with the third.
+    wait_for(lambda: _get_event(server.base_url, first_id)["status"] == "delivered")
+    wait_for(lambda: _get_event(server.base_url, third_id)["status"] == "delivered")
+    final_second = _get_event(server.base_url, second_id)
+    assert final_second["status"] == "expired"
+    assert final_second["attempts_count"] == 0
+    assert [r for r in receipts if r["event_id"] == second_id] == []
+
+    # The expired status is filterable and carries the window fields.
+    listed = httpx.get(
+        f"{server.base_url}/events", params={"status": "expired"}
+    ).json()
+    entry = [e for e in listed["events"] if e["id"] == second_id]
+    assert entry and entry[0]["expires_at"] is not None
+    assert entry[0]["deliver_after"]
+
+
+def test_processing_event_is_not_interrupted_by_expiry(server):
+    from .conftest import _gates
+    token = f"expire-inflight-{uuid.uuid4().hex}"
+    _gates[token] = threading.Event()
+
+    resp = _post_event_obj(server.base_url, {
+        "idempotency_key": uuid.uuid4().hex,
+        "target": f"{server.base_url}/t/block?token={token}",
+        "payload": {},
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=1.5)).isoformat(),
+    })
+    event_id = resp.json()["id"]
+    wait_for(
+        lambda: _get_event(server.base_url, event_id)["status"] == "processing",
+        timeout=10,
+    )
+    try:
+        # The deadline passes while the attempt is in flight: no interruption.
+        time.sleep(2.0)
+        assert _get_event(server.base_url, event_id)["status"] == "processing"
+    finally:
+        httpx.post(f"{server.base_url}/t/release", params={"token": token})
+
+    final = wait_for(
+        lambda: (lambda e: e if e["status"] == "delivered" else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=10,
+    )
+    assert final["attempts_count"] == 1

@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from pydantic import AwareDatetime, BaseModel, Field, HttpUrl, ValidationError
 
 from . import config, db
 from .worker import Worker
@@ -24,6 +24,11 @@ class EventIn(BaseModel):
     idempotency_key: str = Field(min_length=1)
     target: HttpUrl
     payload: Any = Field(default_factory=dict)
+    # Optional delivery window, RFC 3339 (timezone offset required).
+    # deliver_after defaults to the creation moment; expires_at, when
+    # present, must be strictly later than deliver_after.
+    deliver_after: AwareDatetime | None = None
+    expires_at: AwareDatetime | None = None
 
 
 # In-memory counters for the built-in demo sink (not part of the core API).
@@ -41,6 +46,8 @@ def _public_event(event: dict) -> dict:
         "status": event["status"],
         "attempts_count": event["attempts_count"],
         "created_at": event["created_at"],
+        "deliver_after": event.get("deliver_after"),
+        "expires_at": event.get("expires_at"),
         "delivered_at": event.get("delivered_at"),
         "replay_count": event.get("replay_count", 0),
         "last_replayed_at": event.get("last_replayed_at"),
@@ -75,7 +82,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.1.0",
+    version="1.2.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events.",
     lifespan=lifespan,
 )
@@ -89,6 +96,12 @@ async def create_event(request: Request) -> JSONResponse:
     header computed with the shared secret from ``WEBHOOK_SECRET``.
     Replaying an existing idempotency key returns the stored event (200)
     and never enqueues a second delivery.
+
+    Accepts an optional delivery window: ``deliver_after`` (RFC 3339,
+    defaults to the creation moment) postpones the first delivery, and
+    ``expires_at`` (RFC 3339, must be later than ``deliver_after``) bounds
+    how long the event may wait in the queue. Invalid combinations are
+    rejected with 422.
     """
     raw_body = await request.body()
     signature = request.headers.get(config.SIGNATURE_HEADER)
@@ -109,11 +122,16 @@ async def create_event(request: Request) -> JSONResponse:
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
 
-    event, created = db.create_event(
-        idempotency_key=event_in.idempotency_key,
-        target=str(event_in.target),
-        payload=event_in.payload,
-    )
+    try:
+        event, created = db.create_event(
+            idempotency_key=event_in.idempotency_key,
+            target=str(event_in.target),
+            payload=event_in.payload,
+            deliver_after=event_in.deliver_after,
+            expires_at=event_in.expires_at,
+        )
+    except db.InvalidDeliveryWindowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     full = db.get_event(event["id"])
     response = JSONResponse(
         status_code=201 if created else 200, content=_public_event(full)
@@ -125,7 +143,7 @@ async def create_event(request: Request) -> JSONResponse:
 
 @app.get("/events")
 async def list_events(
-    status: str | None = Query(None, pattern="^(queued|processing|delivered|dead)$"),
+    status: str | None = Query(None, pattern="^(queued|processing|delivered|dead|expired)$"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):

@@ -2,16 +2,18 @@
 
 一个本地可运行的 Webhook 可靠投递服务：接收带 **目标端点** 和 **幂等键** 的事件，
 校验 HMAC-SHA256 签名后入队，由后台调度器按顺序、带退避重试地向目标端点投递；
-三次重试仍失败则进入死信。技术栈：**Python · FastAPI · SQLite**。
+三次重试仍失败则进入死信。支持 **投递时间窗**（`deliver_after` / `expires_at`）：
+可预约首次投递时刻，也可为排队等待设置截止期限。技术栈：**Python · FastAPI · SQLite**。
 
 ## 特性
 
 - **HMAC-SHA256 签名校验**：签名针对**原始请求体字节**计算（`X-Webhook-Signature: sha256=<hex>`），密钥来自环境变量 `WEBHOOK_SECRET`，使用恒定时间比较。
-- **幂等接收**：`idempotency_key` 在数据库中有唯一约束。重复提交返回**原事件**（HTTP 200，响应头 `Idempotent-Replay: true`），**不会再次入队或投递**。
-- **同一目标端点严格有序**：以创建顺序（SQLite `rowid`）为准，前一条事件未成功或进入死信前，后一条不会被取出投递。不同端点之间并行投递，互不阻塞。
-- **重试与死信**：首次立即投递；失败后分别等待 **1s / 2s / 4s** 重试（共 4 次尝试）；第 4 次仍失败（非 2xx、超时、连接错误）即进入死信（状态 `dead`）。
+- **幂等接收**：`idempotency_key` 在数据库中有唯一约束。重复提交返回**原事件**（HTTP 200，响应头 `Idempotent-Replay: true`），**不会再次入队或投递**；即使重复请求携带了不同甚至无效的时间窗字段，也一律返回原事件。
+- **投递时间窗**：创建事件可携带 RFC 3339 的 `deliver_after`（默认创建时刻，提前到该时刻之前不投递）与 `expires_at`（必须晚于 `deliver_after`，否则 422）。调度器每次领取前在同一事务中把已到 `expires_at` 且仍为 `queued` 的事件标记为 `expired`：不产生任何投递尝试，并不再阻塞同目标的后续事件；已进入 `processing` 的事件不因到期而中断。
+- **同一目标端点严格有序**：以创建顺序（SQLite `rowid`）为准，前一条事件未成功、进入死信或过期前，后一条不会被取出投递——即使前一条只是在等待自己的 `deliver_after`。不同端点之间并行投递，互不阻塞。
+- **重试与死信**：首次立即投递（或按 `deliver_after` 延迟）；失败后分别等待 **1s / 2s / 4s** 重试（共 4 次尝试）；第 4 次仍失败（非 2xx、超时、连接错误）即进入死信（状态 `dead`）。
 - **死信重放**：`POST /events/{event_id}/replay` 仅接受 `dead` 事件，在一个事务内将其重新入队并开启**新一轮完整**的 1s/2s/4s 退避（再次享有 4 次尝试）。历史 `attempts` 全部保留、`attempt_no` 连续递增，`replay_count` 累计并记录 `last_replayed_at`，幂等键与事件 id 不变；并发重复重放只会生效一次，不会重复投递。
-- **事件查询**：返回每次尝试的时间、HTTP 响应码/错误信息、最终状态（`queued` / `processing` / `delivered` / `dead`），以及 `replay_count` / `last_replayed_at` 重放信息。
+- **事件查询**：返回每次尝试的时间、HTTP 响应码/错误信息、最终状态（`queued` / `processing` / `delivered` / `dead` / `expired`），时间窗字段 `deliver_after` / `expires_at`，以及 `replay_count` / `last_replayed_at` 重放信息。
 - **崩溃恢复**：投递状态全部在 SQLite（WAL 模式）中，重启后把卡在 `processing` 的事件重新排队；出站请求携带 `X-Event-Id` / `X-Idempotency-Key`，投递语义为 at-least-once。
 - 内置一个实验用目标端点 `/dev/sink`，方便本地演示成功/失败/死信。
 
@@ -32,7 +34,7 @@ docker compose up --build
 
 宿主机端口 `8000`，容器内端口 `8000`（在 `docker-compose.yml` 的 `ports` 中可改）。
 数据（事件、投递尝试、死信与重放记录）持久化在命名卷 `webhook-data`（容器内
-`/data/webhooks.db`）；老版本数据库启动时会自动补齐重放相关列，无需手工迁移。
+`/data/webhooks.db`）；老版本数据库启动时会自动补齐重放与时间窗相关列，无需手工迁移。
 
 生产环境请覆盖默认密钥：
 
@@ -72,16 +74,19 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 | `idempotency_key` | 必填，调用方生成的唯一幂等键 |
 | `target` | 必填，目标投递端点的完整 URL（http/https） |
 | `payload` | 可选，任意 JSON，原样转发给目标端点 |
+| `deliver_after` | 可选，RFC 3339 时间戳（须带时区偏移），该时刻之前不投递；缺省为创建时刻 |
+| `expires_at` | 可选，RFC 3339 时间戳（须带时区偏移），必须**晚于** `deliver_after`；到期仍为 `queued` 的事件转为 `expired`，不再投递 |
 
 - 签名缺失/错误 → `401`
+- `expires_at` 早于或等于 `deliver_after`、时间格式非法（非 RFC 3339 / 缺时区）→ `422`
 - 首次创建 → `201`
-- 幂等键重复 → `200`，返回数据库中原事件，带响应头 `Idempotent-Replay: true`，**不会重新投递**
+- 幂等键重复 → `200`，返回数据库中原事件，带响应头 `Idempotent-Replay: true`，**不会重新投递**；新请求里的时间窗字段被忽略（即使无效也不会 422）
 
 ### 2. 查询事件
 
 - `GET /events/{event_id}` — 查询单个事件，含全部投递尝试
 - `GET /events/key/{idempotency_key}` — 按幂等键查询
-- `GET /events?status=dead&limit=50&offset=0` — 列表，可按状态过滤（`queued` / `processing` / `delivered` / `dead`）
+- `GET /events?status=dead&limit=50&offset=0` — 列表，可按状态过滤（`queued` / `processing` / `delivered` / `dead` / `expired`）
 
 响应示例（4 次尝试后进入死信）：
 
@@ -94,6 +99,8 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
   "status": "dead",
   "attempts_count": 4,
   "created_at": "2026-09-17T12:27:13.160640+00:00",
+  "deliver_after": "2026-09-17T12:27:13.160640+00:00",
+  "expires_at": null,
   "delivered_at": null,
   "replay_count": 0,
   "last_replayed_at": null,
@@ -122,7 +129,7 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 | --- | --- |
 | 重放成功，返回重放后的事件（`status=queued`） | `200` |
 | 事件不存在 | `404` |
-| 事件为 `queued` / `processing` / `delivered`（响应体说明当前状态） | `409` |
+| 事件为 `queued` / `processing` / `delivered` / `expired`（响应体说明当前状态） | `409` |
 
 并发重复重放由条件更新（`UPDATE … WHERE status='dead'`）保证只有一个请求生效，
 其余返回 `409`，**不会重复入队或重复投递**。
@@ -189,14 +196,23 @@ signature = "sha256=" + hmac.new(
 重试计划固定为 **1s、2s、4s**（首次失败后），共 4 次尝试；如需调整可修改
 `app/config.py` 中的 `RETRY_BACKOFF` / `MAX_ATTEMPTS`。
 
+投递时间窗的实现要点：`deliver_after` 会折叠进 `next_attempt_at`（首次尝试不早于它）；
+`expires_at` 另存一份 epoch 秒（`expires_at_ts`）供调度器比较。调度器每次领取前在**同一个
+事务**里先把 `expires_at_ts <= now` 且仍为 `queued` 的事件置为 `expired`（`next_attempt_at`
+清空，永不再产生尝试），再按常规规则领取到期事件——因此过期事件会立即解除对同目标后续
+事件的阻塞。`processing` 中的事件不受到期影响，在途尝试会正常完成并进入
+`delivered` / 重试 / 死信流程。
+
 死信重放的实现要点：`events` 表上的 `round_base_attempts` 记录本轮退避的起点；
 重放把它提升到当前 `attempts_count`，新一轮尝试的退避位置按轮内序号重新从 1s
 开始，而 `attempt_no` 保持全局连续。启动时会自动为老数据库补齐 `replay_count` /
-`last_replayed_at` / `round_base_attempts` 三列（`ALTER TABLE`，幂等），无需手工迁移。
+`last_replayed_at` / `round_base_attempts` / `deliver_after` / `expires_at` /
+`expires_at_ts` 六列（`ALTER TABLE`，幂等），并把老行的 `deliver_after` 回填为
+`created_at`（立即到期、从不过期，行为与旧版一致），无需手工迁移。
 
 有序性实现要点：调度器在一个事务中只挑选每个目标端点上「创建最早且退避已到期」
 的事件并原子地置为 `processing`；更早的事件仍在 `queued`/`processing` 时，
-后续事件不会被选中，直到前者 `delivered` 或 `dead`。
+后续事件不会被选中，直到前者 `delivered`、`dead` 或 `expired`。
 
 ## 运行测试
 
@@ -207,7 +223,9 @@ python -m pytest tests/ -v
 
 测试启动真实 uvicorn 端口，端到端覆盖：签名校验（缺失/错误/篡改）、成功投递与查询、
 幂等不重复入队、1/2/4 秒退避后死信、失败后恢复、同端点严格有序（含前序失败阻塞后序直到死信）、
-死信重放（完整新退避轮次、历史保留与连续编号、replay_count 累计、非死信 409/未知 404、并发重放仅生效一次）。
+死信重放（完整新退避轮次、历史保留与连续编号、replay_count 累计、非死信 409/未知 404、并发重放仅生效一次）、
+投递时间窗（`deliver_after` 延迟投递且未到时的前序事件仍阻塞同目标后续事件、无效时间窗 422、
+幂等键重复返回原事件、queued 到期转 `expired` 零尝试并让位、`processing` 不受到期影响）。
 
 ## 项目结构
 

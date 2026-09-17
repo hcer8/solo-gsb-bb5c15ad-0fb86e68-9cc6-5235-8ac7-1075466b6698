@@ -23,7 +23,11 @@ from . import config
 #   delivered  - got a 2xx response (terminal)
 #   dead       - all attempts of the current round exhausted (dead-letter);
 #                terminal unless replayed, which starts a fresh backoff round
-TERMINAL_STATUSES = ("delivered", "dead")
+#   expired    - still queued when its ``expires_at`` deadline was reached
+#                (terminal); never receives an attempt and stops blocking
+#                its endpoint so the next event can proceed. Events already
+#                in ``processing`` are never interrupted by their deadline.
+TERMINAL_STATUSES = ("delivered", "dead", "expired")
 
 
 class ReplayNotAllowedError(Exception):
@@ -36,12 +40,21 @@ class ReplayNotAllowedError(Exception):
             f"event {event_id} is '{status}'; only dead-letter events can be replayed"
         )
 
+
+class InvalidDeliveryWindowError(ValueError):
+    """Raised when ``expires_at`` is not strictly later than ``deliver_after``."""
+
 db_lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
 
 
 def _iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _iso_utc(dt: datetime) -> str:
+    """Normalise an aware datetime to the UTC ISO-8601 format used everywhere."""
+    return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def get_conn() -> sqlite3.Connection:
@@ -73,7 +86,10 @@ def init_db() -> None:
                 delivered_at    TEXT,
                 replay_count    INTEGER NOT NULL DEFAULT 0,
                 last_replayed_at TEXT,
-                round_base_attempts INTEGER NOT NULL DEFAULT 0
+                round_base_attempts INTEGER NOT NULL DEFAULT 0,
+                deliver_after   TEXT NOT NULL,
+                expires_at      TEXT,
+                expires_at_ts   REAL
             );
 
             CREATE TABLE IF NOT EXISTS attempts (
@@ -96,21 +112,31 @@ def init_db() -> None:
 
 
 def _migrate_events(conn: sqlite3.Connection) -> None:
-    """Add replay columns to databases created before replay existed.
+    """Add replay and delivery-window columns to older databases.
 
     ``CREATE TABLE IF NOT EXISTS`` leaves pre-existing files untouched, so
     the new columns are added idempotently here. Existing rows receive the
-    defaults (``replay_count=0``, ``round_base_attempts=0``), which keeps
-    their behaviour identical to the pre-replay state machine.
+    defaults (``replay_count=0``, ``round_base_attempts=0``,
+    ``deliver_after=created_at``, no ``expires_at``), which keeps their
+    behaviour identical to the pre-window state machine: deliver
+    immediately, never expire.
     """
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
     for column, ddl in (
         ("replay_count", "replay_count INTEGER NOT NULL DEFAULT 0"),
         ("last_replayed_at", "last_replayed_at TEXT"),
         ("round_base_attempts", "round_base_attempts INTEGER NOT NULL DEFAULT 0"),
+        ("deliver_after", "deliver_after TEXT"),
+        ("expires_at", "expires_at TEXT"),
+        ("expires_at_ts", "expires_at_ts REAL"),
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE events ADD COLUMN {ddl}")
+    # Rows created before delivery windows existed are due immediately and
+    # never expire, exactly as before.
+    conn.execute(
+        "UPDATE events SET deliver_after = created_at WHERE deliver_after IS NULL"
+    )
 
 
 def reset_stuck_events() -> None:
@@ -131,12 +157,21 @@ def reset_stuck_events() -> None:
 
 
 def create_event(
-    idempotency_key: str, target: str, payload: dict | list
+    idempotency_key: str,
+    target: str,
+    payload: dict | list,
+    deliver_after: datetime | None = None,
+    expires_at: datetime | None = None,
 ) -> tuple[dict, bool]:
     """Insert an event. Returns ``(event, created)``.
 
     If the idempotency key already exists the stored event is returned with
-    ``created=False``; nothing is inserted and nothing is enqueued again.
+    ``created=False``; nothing is inserted, nothing is enqueued again and
+    the delivery-window fields of the new request are ignored entirely.
+
+    For new events ``deliver_after`` defaults to the creation moment and
+    ``expires_at`` (when given) must be strictly later than it, otherwise
+    ``InvalidDeliveryWindowError`` is raised and nothing is stored.
     """
     event_id = uuid.uuid4().hex
     payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -148,12 +183,30 @@ def create_event(
         if existing is not None:
             return dict(existing), False
 
-        now = time.time()
+        now_dt = datetime.now(timezone.utc)
+        deliver_after = deliver_after or now_dt
+        if expires_at is not None and expires_at <= deliver_after:
+            raise InvalidDeliveryWindowError(
+                "expires_at must be later than deliver_after "
+                f"(deliver_after={_iso_utc(deliver_after)}, "
+                f"expires_at={_iso_utc(expires_at)})"
+            )
         conn.execute(
             "INSERT INTO events "
             "(id, idempotency_key, target, payload, status, attempts_count, "
-            " created_at, next_attempt_at) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)",
-            (event_id, idempotency_key, target, payload_json, _iso(), now),
+            " created_at, next_attempt_at, deliver_after, expires_at, expires_at_ts) "
+            "VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                idempotency_key,
+                target,
+                payload_json,
+                _iso_utc(now_dt),
+                deliver_after.timestamp(),
+                _iso_utc(deliver_after),
+                _iso_utc(expires_at) if expires_at is not None else None,
+                expires_at.timestamp() if expires_at is not None else None,
+            ),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
@@ -172,16 +225,31 @@ def _hydrate(row: sqlite3.Row) -> dict:
 def claim_due_events() -> list[dict]:
     """Atomically claim the head event of every endpoint that is due.
 
-    An event is claimable only when it is ``queued``, its backoff has
-    elapsed, and no earlier (lower rowid = earlier creation) event for the
-    same target is still ``queued``/``processing``. Claimed events flip to
-    ``processing`` so another tick can never double-claim them. This is the
-    ordering guarantee: a later event cannot be picked while an earlier one
-    is pending, in flight, or waiting for its retry backoff.
+    One transaction, two steps:
+
+    1. Every ``queued`` event whose ``expires_at`` has passed is flipped to
+       ``expired``. It never receives an attempt and stops blocking its
+       endpoint, so the next event for the same target can proceed. Events
+       already ``processing`` are deliberately not touched — an in-flight
+       attempt is never interrupted by its deadline.
+    2. An event is claimable only when it is ``queued``, its backoff and
+       ``deliver_after`` (both folded into ``next_attempt_at``) have
+       elapsed, and no earlier (lower rowid = earlier creation) event for
+       the same target is still ``queued``/``processing``. Claimed events
+       flip to ``processing`` so another tick can never double-claim them.
+       This is the ordering guarantee: a later event cannot be picked while
+       an earlier one is pending — even if that earlier event is merely
+       waiting for its ``deliver_after`` — in flight, or backing off.
     """
     now = time.time()
     with db_lock:
         conn = get_conn()
+        conn.execute(
+            "UPDATE events SET status = 'expired', next_attempt_at = NULL "
+            "WHERE status = 'queued' "
+            "AND expires_at_ts IS NOT NULL AND expires_at_ts <= ?",
+            (now,),
+        )
         rows = conn.execute(
             """
             SELECT e.* FROM events e
@@ -202,7 +270,7 @@ def claim_due_events() -> list[dict]:
                 "UPDATE events SET status = 'processing' WHERE id = ?",
                 [(r["id"],) for r in rows],
             )
-            conn.commit()
+        conn.commit()
         return [_hydrate(r) for r in rows]
 
 
